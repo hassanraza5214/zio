@@ -345,7 +345,16 @@ object ZIOSpec extends ZIOBaseSpec {
           right2    = (promise1.succeed(()) *> ZIO.never).ensuring(promise2.interrupt *> ZIO.never.interruptible)
           exit     <- ZIO.collectAllPar(List(left, ZIO.collectAllPar(List(right1, right2)))).exit
         } yield assert(exit)(failsCause(containsCause(Cause.fail("fail"))))
-      } @@ nonFlaky
+      } @@ nonFlaky,
+      test("runs finalizers in parallel") {
+        for {
+          promise1 <- Promise.make[Nothing, Unit]
+          promise2 <- Promise.make[Nothing, Unit]
+          left      = ZIO.addFinalizer(promise1.succeed(())) *> promise2.succeed(())
+          right     = promise2.await *> ZIO.addFinalizer(promise1.await)
+          _        <- ZIO.collectAllPar(List(left, right))
+        } yield assertCompletes
+      }
     ),
     suite("collectAllParN")(
       test("returns results in the same order") {
@@ -4193,6 +4202,25 @@ object ZIOSpec extends ZIOBaseSpec {
       test("propagates interruption") {
         val zio = ZIO.never <&> ZIO.never <&> ZIO.fail("fail")
         assertZIO(zio.exit)(fails(equalTo("fail")))
+      },
+      test("propagates FiberRef values") {
+        for {
+          fiberRef <- FiberRef.make(5)
+          workflow  = fiberRef.set(10).delay(2.seconds) <&> fiberRef.set(15)
+          fiber    <- workflow.fork
+          _        <- TestClock.adjust(2.seconds)
+          _        <- fiber.join
+          value    <- fiberRef.get
+        } yield assertTrue(value == 10)
+      },
+      test("runs finalizers in parallel") {
+        for {
+          promise1 <- Promise.make[Nothing, Unit]
+          promise2 <- Promise.make[Nothing, Unit]
+          left      = ZIO.addFinalizer(promise1.succeed(())) *> promise2.succeed(())
+          right     = promise2.await *> ZIO.addFinalizer(promise1.await)
+          _        <- left.zipPar(right)
+        } yield assertCompletes
       }
     ),
     suite("toFuture")(

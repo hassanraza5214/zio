@@ -17,7 +17,7 @@
 package zio
 
 import zio.internal.{FiberScope, Platform}
-import zio.metrics.MetricLabel
+import zio.metrics.{MetricLabel, Metrics}
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.io.IOException
@@ -1228,7 +1228,7 @@ sealed trait ZIO[-R, +E, +A]
    * Returns a new scoped workflow that runs finalizers added to the scope of
    * this workflow in parallel.
    */
-  final def parallelFinalizers(implicit trace: Trace): ZIO[R with Scope, E, A] =
+  final def parallelFinalizers(implicit trace: Trace): ZIO[R, E, A] =
     ZIO.parallelFinalizers(self)
 
   /**
@@ -1311,8 +1311,10 @@ sealed trait ZIO[-R, +E, +A]
    * the race will be interrupted immediately
    */
   final def raceAll[R1 <: R, E1 >: E, A1 >: A](
-    ios: => Iterable[ZIO[R1, E1, A1]]
-  )(implicit trace: Trace): ZIO[R1, E1, A1] = {
+    ios0: => Iterable[ZIO[R1, E1, A1]]
+  )(implicit trace: Trace): ZIO[R1, E1, A1] = ZIO.suspendSucceed {
+    val ios = ios0
+
     def arbiter[E1, A1](
       fibers: List[Fiber[E1, A1]],
       winner: Fiber[E1, A1],
@@ -1335,9 +1337,7 @@ sealed trait ZIO[-R, +E, +A]
       fails <- Ref.make[Int](ios.size)
       c <- ZIO.uninterruptibleMask { restore =>
              for {
-               head <- ZIO.interruptible(self).fork
-               tail <- ZIO.foreach(ios)(io => ZIO.interruptible(io).fork)
-               fs    = head :: tail.toList
+               fs <- ZIO.foreach(self :: ios.toList)(io => ZIO.interruptible(io).fork)
                _ <- fs.foldLeft[ZIO[R1, E1, Any]](ZIO.unit) { case (io, f) =>
                       io *> f.await.flatMap(arbiter(fs, f, done, fails)).fork
                     }
@@ -1858,7 +1858,7 @@ sealed trait ZIO[-R, +E, +A]
    * has meaning if used within a scope where finalizers are being run in
    * parallel.
    */
-  final def sequentialFinalizers(implicit trace: Trace): ZIO[R with Scope, E, A] =
+  final def sequentialFinalizers(implicit trace: Trace): ZIO[R, E, A] =
     ZIO.sequentialFinalizers(self)
 
   /**
@@ -2521,16 +2521,16 @@ sealed trait ZIO[-R, +E, +A]
   )(f: (A, B) => C)(implicit trace: Trace): ZIO[R1, E1, C] =
     ZIO.uninterruptibleMask { restore =>
       ZIO.transplant { graft =>
-        val promise = Promise.unsafe.make[Unit, Unit](FiberId.None)(Unsafe.unsafe)
+        val promise = Promise.unsafe.make[Unit, Boolean](FiberId.None)(Unsafe.unsafe)
         val ref     = new java.util.concurrent.atomic.AtomicBoolean(false)
 
-        def fork[R, E, A](zio: => ZIO[R, E, A]): ZIO[R, Nothing, Fiber[E, A]] =
+        def fork[R, E, A](zio: => ZIO[R, E, A], side: Boolean): ZIO[R, Nothing, Fiber[E, A]] =
           graft(restore(zio))
             .foldCauseZIO(
               cause => promise.fail(()) *> ZIO.refailCause(cause),
               a =>
                 if (ref.getAndSet(true)) {
-                  promise.unsafe.done(ZIO.unit)(Unsafe.unsafe)
+                  promise.unsafe.done(ZIO.succeedNow(side))(Unsafe.unsafe)
                   ZIO.succeed(a)
                 } else {
                   ZIO.succeed(a)
@@ -2538,18 +2538,21 @@ sealed trait ZIO[-R, +E, +A]
             )
             .forkDaemon
 
-        fork(self).zip(fork(that)).flatMap { case (left, right) =>
-          restore(promise.await).foldCauseZIO(
-            cause =>
-              left.interruptFork *> right.interruptFork *>
-                left.await.zip(right.await).flatMap { case (left, right) =>
-                  left.zipWith(right)(f, _ && _) match {
-                    case Exit.Failure(causes) => ZIO.refailCause(cause.stripFailures && causes)
-                    case _                    => ZIO.refailCause(cause.stripFailures)
-                  }
-                },
-            _ => left.join.zipWith(right.join)(f)
-          )
+        ZIO.parallelFinalizersMask(restore => fork(restore(self), false).zip(fork(restore(that), true))).flatMap {
+          case (left, right) =>
+            restore(promise.await).foldCauseZIO(
+              cause =>
+                left.interruptFork *> right.interruptFork *>
+                  left.await.zip(right.await).flatMap { case (left, right) =>
+                    left.zipWith(right)(f, _ && _) match {
+                      case Exit.Failure(causes) => ZIO.refailCause(cause.stripFailures && causes)
+                      case _                    => ZIO.refailCause(cause.stripFailures)
+                    }
+                  },
+              leftWins =>
+                if (leftWins) left.join.zipWith(right.join)((a, b) => f(a, b))
+                else right.join.zipWith(left.join)((b, a) => f(a, b))
+            )
         }
       }
     }
@@ -4170,6 +4173,14 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     Ref.make(zero).flatMap(acc => foreachParDiscard(in)(_.flatMap(a => acc.update(f(_, a)))) *> acc.get)
 
   /**
+   * Gets current metrics snapshot.
+   */
+  def metrics(implicit trace: Trace): UIO[Metrics] =
+    ZIO.succeedUnsafe { implicit u =>
+      Metrics(internal.metrics.metricRegistry.snapshot())
+    }
+
+  /**
    * Returns a effect that will never produce anything. The moral equivalent of
    * `while(true) {}`, only without the wasted CPU cycles. Fibers that execute
    * this effect will be automatically garbage collected on the JVM when no
@@ -4244,8 +4255,30 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
    * Returns a new scoped workflow that runs finalizers added to the scope of
    * this workflow in parallel.
    */
-  def parallelFinalizers[R, E, A](zio: => ZIO[R, E, A])(implicit trace: Trace): ZIO[R with Scope, E, A] =
-    ZIO.scopeWith(_.forkWith(ExecutionStrategy.Parallel).flatMap(_.extend[R](zio)))
+  def parallelFinalizers[R, E, A](zio: => ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+    ZIO.environmentWithZIO[R] { environment =>
+      environment.getDynamic[Scope] match {
+        case None => zio
+        case Some(scope) =>
+          scope.executionStrategy match {
+            case ExecutionStrategy.Parallel => zio
+            case _                          => scope.forkWith(ExecutionStrategy.Parallel).flatMap(_.extend[R](zio))
+          }
+      }
+    }
+
+  def parallelFinalizersMask[R, E, A](f: ZIO.FinalizersRestorer => ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+    ZIO.environmentWithZIO[R] { environment =>
+      environment.getDynamic[Scope] match {
+        case None => f(ZIO.FinalizersRestorer.Identity)
+        case Some(scope) =>
+          scope.executionStrategy match {
+            case ExecutionStrategy.Parallel     => ZIO.parallelFinalizers(f(ZIO.FinalizersRestorer.MakeParallel))
+            case ExecutionStrategy.ParallelN(n) => ZIO.parallelFinalizers(f(ZIO.FinalizersRestorer.MakeParallelN(n)))
+            case ExecutionStrategy.Sequential   => ZIO.parallelFinalizers(f(ZIO.FinalizersRestorer.MakeSequential))
+          }
+      }
+    }
 
   /**
    * Retrieves the maximum number of fibers for parallel operators or `None` if
@@ -4449,8 +4482,17 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
    * has meaning if used within a scope where finalizers are being run in
    * parallel.
    */
-  def sequentialFinalizers[R, E, A](zio: => ZIO[R, E, A])(implicit trace: Trace): ZIO[R with Scope, E, A] =
-    ZIO.scopeWith(_.fork.flatMap(_.extend[R](zio)))
+  def sequentialFinalizers[R, E, A](zio: => ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+    ZIO.environmentWithZIO[R] { environment =>
+      environment.getDynamic[Scope] match {
+        case None => zio
+        case Some(scope) =>
+          scope.executionStrategy match {
+            case ExecutionStrategy.Sequential => zio
+            case _                            => scope.forkWith(ExecutionStrategy.Sequential).flatMap(_.extend[R](zio))
+          }
+      }
+    }
 
   /**
    * Sets the `FiberRef` values for the fiber running this effect to the values
@@ -5888,6 +5930,51 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     }
   }
 
+  sealed trait FinalizersRestorer {
+    def apply[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A]
+  }
+
+  object FinalizersRestorer {
+    def apply(executionStrategy: ExecutionStrategy): FinalizersRestorer =
+      executionStrategy match {
+        case ExecutionStrategy.Sequential =>
+          FinalizersRestorer.MakeSequential
+        case ExecutionStrategy.Parallel =>
+          FinalizersRestorer.MakeParallel
+        case ExecutionStrategy.ParallelN(n) =>
+          FinalizersRestorer.MakeParallelN(n)
+      }
+
+    case object Identity extends FinalizersRestorer {
+      def apply[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+        zio
+    }
+
+    case object MakeParallel extends FinalizersRestorer {
+      def apply[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+        zio.parallelFinalizers
+    }
+
+    final case class MakeParallelN(n: Int) extends FinalizersRestorer {
+      def apply[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+        ZIO.environmentWithZIO[R] { environment =>
+          environment.getDynamic[Scope] match {
+            case None => zio
+            case Some(scope) =>
+              scope.executionStrategy match {
+                case ExecutionStrategy.ParallelN(n) => zio
+                case _                              => scope.forkWith(ExecutionStrategy.ParallelN(n)).flatMap(_.extend[R](zio))
+              }
+          }
+        }
+    }
+
+    case object MakeSequential extends FinalizersRestorer {
+      def apply[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+        zio.sequentialFinalizers
+    }
+  }
+
   private[zio] val someFatal   = Some(LogLevel.Fatal)
   private[zio] val someError   = Some(LogLevel.Error)
   private[zio] val someWarning = Some(LogLevel.Warning)
@@ -5969,19 +6056,21 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
           val promise = Promise.unsafe.make[Unit, Unit](FiberId.None)(Unsafe.unsafe)
           val ref     = new java.util.concurrent.atomic.AtomicInteger(0)
           ZIO.transplant { graft =>
-            ZIO.foreach(as) { a =>
-              graft {
-                restore(ZIO.suspendSucceed(f(a))).foldCauseZIO(
-                  cause => promise.fail(()) *> ZIO.refailCause(cause),
-                  _ =>
-                    if (ref.incrementAndGet == size) {
-                      promise.unsafe.done(ZIO.unit)(Unsafe.unsafe)
-                      ZIO.unit
-                    } else {
-                      ZIO.unit
-                    }
-                )
-              }.forkDaemon
+            ZIO.parallelFinalizersMask { restoreFinalizers =>
+              ZIO.foreach(as) { a =>
+                graft {
+                  restore(restoreFinalizers(ZIO.suspendSucceed(f(a)))).foldCauseZIO(
+                    cause => promise.fail(()) *> ZIO.refailCause(cause),
+                    _ =>
+                      if (ref.incrementAndGet == size) {
+                        promise.unsafe.done(ZIO.unit)(Unsafe.unsafe)
+                        ZIO.unit
+                      } else {
+                        ZIO.unit
+                      }
+                  )
+                }.forkDaemon
+              }
             }
           }.flatMap { fibers =>
             restore(promise.await).foldCauseZIO(

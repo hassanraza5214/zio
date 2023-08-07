@@ -1321,7 +1321,13 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   def flatMap[R1 <: R, E1 >: E, B](f: A => ZStream[R1, E1, B])(implicit
     trace: Trace
   ): ZStream[R1, E1, B] =
-    new ZStream(channel.concatMap(as => as.map(f).map(_.channel).fold(ZChannel.unit)(_ *> _)))
+    new ZStream(
+      channel.concatMap(as =>
+        as.foldLeft[ZChannel[R1, Any, Any, Any, E1, zio.Chunk[B], Any]](ZChannel.unit) { case (acc, a) =>
+          acc *> f(a).channel
+        }
+      )
+    )
 
   /**
    * Maps each element of this stream to another stream and returns the
@@ -2221,8 +2227,8 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
       handoff <- ZStream.Handoff.make[Signal]
     } yield {
       val consumer: ZSink[R1, E1, A1, A1, Unit] = sink.collectLeftover
-        .foldSink(
-          e => ZSink.fromZIO(p.fail(e)) *> ZSink.fail(e),
+        .foldCauseSink(
+          c => ZSink.fromZIO(p.failCause(c)) *> ZSink.failCause(c),
           { case (z1, leftovers) =>
             lazy val loop: ZChannel[Any, E, Chunk[A1], Any, E1, Chunk[A1], Unit] = ZChannel.readWithCause(
               (in: Chunk[A1]) => ZChannel.fromZIO(handoff.offer(Signal.Emit(in))) *> loop,
@@ -3104,7 +3110,7 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   def tapError[R1 <: R, E1 >: E](
     f: E => ZIO[R1, E1, Any]
   )(implicit ev: CanFail[E], trace: Trace): ZStream[R1, E1, A] =
-    catchAll(e => ZStream.fromZIO(f(e) *> ZIO.fail(e)))
+    tapErrorCause(_.failureOrCause.fold(f, _ => ZIO.unit))
 
   /**
    * Returns a stream that effectfully "peeks" at the cause of failure of the
@@ -3112,8 +3118,16 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
    */
   def tapErrorCause[R1 <: R, E1 >: E](
     f: Cause[E] => ZIO[R1, E1, Any]
-  )(implicit ev: CanFail[E], trace: Trace): ZStream[R1, E1, A] =
-    catchAllCause(e => ZStream.fromZIO(f(e) *> ZIO.refailCause(e)))
+  )(implicit ev: CanFail[E], trace: Trace): ZStream[R1, E1, A] = {
+    lazy val tapErrorCause: ZChannel[R1, E, Chunk[A], Any, E1, Chunk[A], Any] =
+      ZChannel.readWithCause(
+        chunk => ZChannel.write(chunk) *> tapErrorCause,
+        cause => ZChannel.fromZIO(f(cause)) *> ZChannel.refailCause(cause),
+        done => ZChannel.succeedNow(done)
+      )
+
+    new ZStream(self.channel.pipeTo(tapErrorCause))
+  }
 
   /**
    * Sends all elements emitted by this stream to the specified sink in addition
@@ -4273,33 +4287,41 @@ object ZStream extends ZStreamPlatformSpecificConstructors {
    */
   def fromIteratorSucceed[A](iterator: => Iterator[A], maxChunkSize: => Int = DefaultChunkSize)(implicit
     trace: Trace
-  ): ZStream[Any, Nothing, A] =
-    ZStream.unwrap {
-      ZIO.succeed(ChunkBuilder.make[A]()).map { builder =>
-        def loop(iterator: Iterator[A]): ZChannel[Any, Any, Any, Any, Nothing, Chunk[A], Any] =
-          ZChannel.unwrap {
-            ZIO.succeed {
-              if (maxChunkSize == 1) {
-                if (iterator.hasNext) {
-                  ZChannel.write(Chunk.single(iterator.next())) *> loop(iterator)
-                } else ZChannel.unit
-              } else {
-                builder.clear()
-                var count = 0
-                while (count < maxChunkSize && iterator.hasNext) {
-                  builder += iterator.next()
-                  count += 1
-                }
-                if (count > 0) {
-                  ZChannel.write(builder.result()) *> loop(iterator)
-                } else ZChannel.unit
-              }
-            }
-          }
+  ): ZStream[Any, Nothing, A] = {
 
-        new ZStream(loop(iterator))
+    def writeOneByOne(iterator: Iterator[A]): ZChannel[Any, Any, Any, Any, Nothing, Chunk[A], Any] =
+      if (iterator.hasNext)
+        ZChannel.write(Chunk.single(iterator.next())) *> writeOneByOne(iterator)
+      else
+        ZChannel.unit
+
+    def writeChunks(iterator: Iterator[A]): ZChannel[Any, Any, Any, Any, Nothing, Chunk[A], Any] =
+      ZChannel.succeed(ChunkBuilder.make[A]()).flatMap { builder =>
+        def loop(iterator: Iterator[A]): ZChannel[Any, Any, Any, Any, Nothing, Chunk[A], Any] = {
+          builder.clear()
+          var count = 0
+          while (count < maxChunkSize && iterator.hasNext) {
+            builder += iterator.next()
+            count += 1
+          }
+          if (count > 0)
+            ZChannel.write(builder.result()) *> loop(iterator)
+          else
+            ZChannel.unit
+        }
+
+        loop(iterator)
+      }
+
+    ZStream.fromChannel {
+      ZChannel.suspend {
+        if (maxChunkSize == 1)
+          writeOneByOne(iterator)
+        else
+          writeChunks(iterator)
       }
     }
+  }
 
   /**
    * Creates a stream from an iterator that may potentially throw exceptions

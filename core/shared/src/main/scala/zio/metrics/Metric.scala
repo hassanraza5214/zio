@@ -398,7 +398,7 @@ object Metric {
     val fiberSuccesses = Metric.counter("zio_fiber_successes")
     val fiberFailures  = Metric.counter("zio_fiber_failures")
     val fiberLifetimes =
-      Metric.histogram("zio_fiber_lifetimes", MetricKeyType.Histogram.Boundaries.exponential(1.0, 2.0, 100))
+      Metric.histogram("zio_fiber_lifetimes", MetricKeyType.Histogram.Boundaries.exponential(0.001, 2.0, 100))
   }
 
   /**
@@ -617,7 +617,7 @@ object Metric {
       .tagged(MetricLabel("time_unit", chronoUnit.toString.toLowerCase()))
 
     base.contramap[Duration] { (duration: Duration) =>
-      duration.toNanos / chronoUnit.getDuration.toNanos
+      duration.toNanos.toDouble / chronoUnit.getDuration.toNanos
     }
   }
 
@@ -632,7 +632,7 @@ object Metric {
       .tagged(MetricLabel("time_unit", chronoUnit.toString.toLowerCase()))
 
     base.contramap[Duration] { (duration: Duration) =>
-      duration.toNanos / chronoUnit.getDuration.toNanos
+      duration.toNanos.toDouble / chronoUnit.getDuration.toNanos
     }
   }
 }
