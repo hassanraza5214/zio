@@ -121,6 +121,7 @@ Want to see your company here? [Submit a PR](https://github.com/zio/zio/edit/ser
 * [Megogo](https://megogo.net)
 * [MOIA](https://www.moia.io)
 * [Mylivn](https://www.mylivn.com/)
+* [Malertech](https://malertech.de/)
 * [NewMotion](https://newmotion.com)
 * [Nexxchange](https://www.nexxchange.com)
 * [Nike](https://nike.com)
